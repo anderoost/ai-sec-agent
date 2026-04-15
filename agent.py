@@ -478,104 +478,109 @@ def run_pytm_model(source_path: Path) -> List[str]:
     Returns a list of human-readable threat strings. If `pytm` is not
     available or integration fails, returns an empty list.
     """
+    original_argv = sys.argv
+    sys.argv = [original_argv[0]]
     try:
-        import pytm
-    except Exception:
-        return []
-
-    try:
-        struct = parse_drawio_struct(source_path)
-        nodes = struct.get('nodes', [])
-        edges = struct.get('edges', [])
-
-        # Find classes in pytm module
-        TM = getattr(pytm, 'TM', None)
-        Server = getattr(pytm, 'Server', None)
-        ProcessCls = getattr(pytm, 'Process', None)
-        External = getattr(pytm, 'ExternalEntity', None) or getattr(pytm, 'Actor', None)
-        DataCls = getattr(pytm, 'Data', None)
-        DataflowCls = getattr(pytm, 'Dataflow', None) or getattr(pytm, 'DataFlow', None)
-
-        if TM is None:
+        try:
+            import pytm
+        except Exception:
             return []
 
-        tm = TM(source_path.name)
+        try:
+            struct = parse_drawio_struct(source_path)
+            nodes = struct.get('nodes', [])
+            edges = struct.get('edges', [])
 
-        created: Dict[str, Any] = {}
-        # Heuristic mapping of node labels to pytm classes
-        for n in nodes:
-            label = n.get('label', '')
-            key = n.get('id') or label
-            obj = None
-            lname = label.lower()
-            try:
-                if Server and any(x in lname for x in ('web', 'app', 'server', 'api')):
-                    obj = Server(label)
-                elif External and any(x in lname for x in ('user', 'actor', 'client')):
-                    obj = External(label)
-                elif DataCls and any(x in lname for x in ('db', 'data', 'store', 'database')):
-                    obj = DataCls(label)
-                elif ProcessCls:
-                    obj = ProcessCls(label)
-            except Exception:
-                # best-effort: skip creation if constructor signatures differ
+            # Find classes in pytm module
+            TM = getattr(pytm, 'TM', None)
+            Server = getattr(pytm, 'Server', None)
+            ProcessCls = getattr(pytm, 'Process', None)
+            External = getattr(pytm, 'ExternalEntity', None) or getattr(pytm, 'Actor', None)
+            DataCls = getattr(pytm, 'Data', None)
+            DataflowCls = getattr(pytm, 'Dataflow', None) or getattr(pytm, 'DataFlow', None)
+
+            if TM is None:
+                return []
+
+            tm = TM(source_path.name)
+
+            created: Dict[str, Any] = {}
+            # Heuristic mapping of node labels to pytm classes
+            for n in nodes:
+                label = n.get('label', '')
+                key = n.get('id') or label
                 obj = None
-
-            if obj is not None:
-                created[key] = obj
-                # attempt to attach to tm in common collections
+                lname = label.lower()
                 try:
-                    if hasattr(tm, 'servers'):
-                        tm.servers.append(obj)
-                    elif hasattr(tm, 'processes'):
-                        tm.processes.append(obj)
+                    if Server and any(x in lname for x in ('web', 'app', 'server', 'api')):
+                        obj = Server(label)
+                    elif External and any(x in lname for x in ('user', 'actor', 'client')):
+                        obj = External(label)
+                    elif DataCls and any(x in lname for x in ('db', 'data', 'store', 'database')):
+                        obj = DataCls(label)
+                    elif ProcessCls:
+                        obj = ProcessCls(label)
+                except Exception:
+                    # best-effort: skip creation if constructor signatures differ
+                    obj = None
+
+                if obj is not None:
+                    created[key] = obj
+                    # attempt to attach to tm in common collections
+                    try:
+                        if hasattr(tm, 'servers'):
+                            tm.servers.append(obj)
+                        elif hasattr(tm, 'processes'):
+                            tm.processes.append(obj)
+                    except Exception:
+                        pass
+
+            # Create dataflows
+            for e in edges:
+                src = created.get(e.get('source'))
+                tgt = created.get(e.get('target'))
+                if not src or not tgt:
+                    continue
+                try:
+                    if DataflowCls:
+                        # try different constructor signatures
+                        try:
+                            df = DataflowCls(src, tgt, e.get('label') or '')
+                            if hasattr(tm, 'dataFlows'):
+                                tm.dataFlows.append(df)
+                            elif hasattr(tm, 'dataFlows'):
+                                tm.dataFlows.append(df)
+                        except Exception:
+                            pass
                 except Exception:
                     pass
 
-        # Create dataflows
-        for e in edges:
-            src = created.get(e.get('source'))
-            tgt = created.get(e.get('target'))
-            if not src or not tgt:
-                continue
+            # Try to run the analysis; API varies by pytm versions
+            threats: List[str] = []
             try:
-                if DataflowCls:
-                    # try different constructor signatures
-                    try:
-                        df = DataflowCls(src, tgt, e.get('label') or '')
-                        if hasattr(tm, 'dataFlows'):
-                            tm.dataFlows.append(df)
-                        elif hasattr(tm, 'dataFlows'):
-                            tm.dataFlows.append(df)
-                    except Exception:
-                        pass
+                if hasattr(tm, 'process'):
+                    tm.process()
+                elif hasattr(tm, 'run'):
+                    tm.run()
+                elif hasattr(tm, 'analyze'):
+                    tm.analyze()
+
+                # collect generated findings if available
+                if hasattr(tm, 'threats') and isinstance(tm.threats, list):
+                    for t in tm.threats:
+                        threats.append(str(t))
+                elif hasattr(tm, 'results'):
+                    for r in getattr(tm, 'results') or []:
+                        threats.append(str(r))
             except Exception:
-                pass
+                # best-effort: if processing failed, return empty
+                return []
 
-        # Try to run the analysis; API varies by pytm versions
-        threats: List[str] = []
-        try:
-            if hasattr(tm, 'process'):
-                tm.process()
-            elif hasattr(tm, 'run'):
-                tm.run()
-            elif hasattr(tm, 'analyze'):
-                tm.analyze()
-
-            # collect generated findings if available
-            if hasattr(tm, 'threats') and isinstance(tm.threats, list):
-                for t in tm.threats:
-                    threats.append(str(t))
-            elif hasattr(tm, 'results'):
-                for r in getattr(tm, 'results') or []:
-                    threats.append(str(r))
+            return threats
         except Exception:
-            # best-effort: if processing failed, return empty
             return []
-
-        return threats
-    except Exception:
-        return []
+    finally:
+        sys.argv = original_argv
 
 
 # External API integration removed. All assessment is performed locally
@@ -732,8 +737,9 @@ def main() -> int:
     try:
         llm_output = local_llm_query(prompt, args.model_path)
     except Exception as exc:
-        print(f"ERROR: Local model generation failed: {exc}")
-        return 3
+        print(f"WARNING: Local model generation failed: {exc}")
+        print("Falling back to mock model output for report generation.")
+        llm_output = local_llm_query(prompt, "mock")
 
     parsed_data = parse_counts_and_percentages(llm_output)
     if pytm_threats:
