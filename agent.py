@@ -7,11 +7,26 @@ import argparse
 import gzip
 import io
 import json
+import os
 import re
 import sys
 import zipfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+
+# Load environment variables from .env file
+try:
+    from dotenv import load_dotenv
+    # Load .env from the script directory
+    env_path = Path(__file__).parent / ".env"
+    load_dotenv(env_path)
+except ImportError:
+    pass
+
+try:
+    from openai import OpenAI
+except ImportError:
+    OpenAI = None
 
 
 def parse_drawio(file_path: Path) -> str:
@@ -219,6 +234,27 @@ def build_architecture_summary(source_path: Path, use_ocr: bool = False) -> str:
 
 
 def local_llm_query(prompt: str, model_path: str, max_tokens: int = 1024) -> str:
+    # Check for OpenAI API key first
+    openai_api_key = os.getenv("OPENAI_API_KEY")
+    openai_model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+    
+    if openai_api_key and OpenAI is not None:
+        try:
+            client = OpenAI(api_key=openai_api_key)
+            response = client.chat.completions.create(
+                model=openai_model,
+                messages=[
+                    {"role": "system", "content": "You are a cybersecurity expert. Provide structured threat assessments mapped to CIS Critical Security Controls."},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.2,
+                max_tokens=max_tokens,
+            )
+            return response.choices[0].message.content.strip()
+        except Exception as exc:
+            print(f"WARNING: OpenAI API call failed: {exc}")
+            print("Falling back to local model or mock output.")
+
     # Quick mock mode for smoke tests
     if model_path in ("mock", "test-mock"):
         return (
@@ -345,22 +381,26 @@ def format_assessment_prompt(architecture_text: str) -> str:
     controls_list = "\n".join([f"- {c}" for c in controls])
 
     return (
-        "You are a cybersecurity analyst reviewing an architecture diagram. "
-        "Provide a concise threat assessment mapped to the following CIS Critical Security Controls and their relevant safeguards:\n"
-        f"{controls_list}\n\n"
-        "Architecture description:\n"
-        f"{architecture_text}\n\n"
-        "Respond with exact lines for counts and percentages, and when applicable include CIS Control and Safeguard numbers in parentheses.\n"
+        "You are a cybersecurity analyst. Analyze this architecture and provide threat assessment.\n\n"
+        "START WITH EXACT THREAT COUNTS on separate lines (NO OTHER TEXT before these lines):\n"
         "Critical: <number>\n"
         "High: <number>\n"
         "Medium: <number>\n"
         "Low: <number>\n\n"
-        "For each control above, provide a coverage percentage line like:\n"
-        "<Control Name> coverage: <percentage>% (CIS Control <x>, Safeguard <y>)\n\n"
-        "Threat examples (prefix each with '- '):\n"
-        "- ...\n\n"
-        "CIS notes and recommended safeguards (include control/safeguard numbers when relevant):\n"
-        "- ...\n"
+        "THEN provide coverage for each CIS control on separate lines:\n"
+        "Data Protection coverage: <percentage>% (CIS Control 13, Safeguard 13.1)\n"
+        "Account Management coverage: <percentage>% (CIS Control 5, Safeguard 5.2)\n"
+        "Access Control Management coverage: <percentage>% (CIS Control 6, Safeguard 6.1)\n"
+        "Audit Log Management coverage: <percentage>% (CIS Control 8, Safeguard 8.3)\n"
+        "Network Monitoring and Defense coverage: <percentage>% (CIS Control 13, Safeguard 13.2)\n"
+        "Application Software Security coverage: <percentage>% (CIS Control 16, Safeguard 16.4)\n\n"
+        "THEN list threat examples (each line starts with '- '):\n"
+        "- [threat description]\n\n"
+        "THEN provide CIS recommendations (each line starts with '- '):\n"
+        "- [recommendation with CIS Control and Safeguard details]\n\n"
+        "ARCHITECTURE TO ANALYZE:\n"
+        f"{architecture_text}\n\n"
+        f"CIS Controls:\n{controls_list}"
     )
 
 
@@ -704,10 +744,9 @@ def main() -> int:
     parser.add_argument(
         "--model-path",
         required=False,
-        default="gemma3-270m",
-        help="Path or identifier of a local/open-source model (default: gemma3-270m).",
+        default="gpt-4o-mini",
+        help="Model identifier. Uses OpenAI API if OPENAI_API_KEY is set, otherwise tries local models (default: gpt-4o-mini).",
     )
-    # External API integration removed; assessments are local using CIS controls.
     parser.add_argument("--format", choices=["md", "pdf"], help="Explicit output format. Overrides output extension.")
     parser.add_argument("--ocr", action="store_true", help="Enable OCR when extracting PDF text from image-based diagrams.")
     args = parser.parse_args()
@@ -733,13 +772,19 @@ def main() -> int:
     except Exception:
         pytm_threats = []
 
+    # Check which backend will be used
+    openai_api_key = os.getenv("OPENAI_API_KEY")
+    if openai_api_key:
+        print("Using OpenAI API for threat assessment...")
+    else:
+        print("Using local model for threat assessment (set OPENAI_API_KEY to use OpenAI)...")
+
     prompt = format_assessment_prompt(architecture_summary)
     try:
         llm_output = local_llm_query(prompt, args.model_path)
     except Exception as exc:
-        print(f"WARNING: Local model generation failed: {exc}")
-        print("Falling back to mock model output for report generation.")
-        llm_output = local_llm_query(prompt, "mock")
+        print(f"ERROR: Model generation failed: {exc}")
+        return 3
 
     parsed_data = parse_counts_and_percentages(llm_output)
     if pytm_threats:
