@@ -1,0 +1,23 @@
+[project]
+name = "ai-sec-agent"
+version = "0.1.0"
+description = "Local AI-based security assessment agent for architecture diagrams."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+dependencies = [
+  "llama-cpp-python>=0.1.80",
+  "PyMuPDF>=1.22.0",
+  "reportlab>=4.0",
+  "requests>=2.31",
+  "markdown>=3.4",
+  "Pillow>=10.0",
+  "pytesseract>=0.3",
+]
+
+[project.optional-dependencies]
+extras = ["transformers>=4.35.0", "torch>=2.0.0"]
+
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
