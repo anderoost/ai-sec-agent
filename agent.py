@@ -96,6 +96,63 @@ def parse_drawio(file_path: Path) -> str:
     return "\n".join(summary)
 
 
+def parse_drawio_struct(file_path: Path) -> Dict[str, Any]:
+    """Return structured nodes and edges from a Draw.io file for programmatic use."""
+    raw = file_path.read_bytes()
+    xml_text = None
+    stripped = raw.lstrip()
+
+    if stripped.startswith(b"<"):
+        xml_text = raw.decode("utf-8", errors="ignore")
+    else:
+        try:
+            with zipfile.ZipFile(io.BytesIO(raw)) as archive:
+                for name in archive.namelist():
+                    if name.endswith((".drawio", ".xml", ".txt")):
+                        xml_text = archive.read(name).decode("utf-8", errors="ignore")
+                        break
+        except zipfile.BadZipFile:
+            try:
+                xml_text = gzip.decompress(raw).decode("utf-8", errors="ignore")
+            except OSError:
+                xml_text = raw.decode("utf-8", errors="ignore")
+
+    if xml_text is None or not xml_text.strip():
+        raise ValueError("Unable to parse Draw.io input for structure extraction.")
+
+    try:
+        import xml.etree.ElementTree as ET
+
+        root = ET.fromstring(xml_text)
+    except Exception as exc:
+        raise ValueError(f"Unable to parse Draw.io XML: {exc}") from exc
+
+    nodes: List[Dict[str, str]] = []
+    edges: List[Dict[str, str]] = []
+
+    for cell in root.findall('.//mxCell'):
+        cell_id = cell.get('id', '')
+        value = (cell.get('value') or '').strip()
+        edge = cell.get('edge') == '1'
+        vertex = cell.get('vertex') == '1'
+
+        if vertex or (value and not edge):
+            node = {'id': cell_id, 'label': value or '<unnamed>'}
+            nodes.append(node)
+
+        if edge:
+            edges.append(
+                {
+                    'id': cell_id,
+                    'source': cell.get('source', ''),
+                    'target': cell.get('target', ''),
+                    'label': value,
+                }
+            )
+
+    return {'nodes': nodes, 'edges': edges}
+
+
 def parse_pdf(file_path: Path, use_ocr: bool = False) -> str:
     try:
         import fitz
@@ -162,6 +219,86 @@ def build_architecture_summary(source_path: Path, use_ocr: bool = False) -> str:
 
 
 def local_llm_query(prompt: str, model_path: str, max_tokens: int = 1024) -> str:
+    # Quick mock mode for smoke tests
+    if model_path in ("mock", "test-mock"):
+        return (
+            "Critical: 1\n"
+            "High: 2\n"
+            "Medium: 3\n"
+            "Low: 4\n\n"
+            "Data Protection coverage: 60% (CIS Control 3, Safeguard 3.1)\n"
+            "Account Management coverage: 50% (CIS Control 5, Safeguard 5.2)\n"
+            "Access Control Management coverage: 40% (CIS Control 6, Safeguard 6.1)\n"
+            "Audit Log Management coverage: 30% (CIS Control 8, Safeguard 8.3)\n"
+            "Network Monitoring and Defense coverage: 45% (CIS Control 13, Safeguard 13.2)\n"
+            "Application Software Security coverage: 55% (CIS Control 16, Safeguard 16.4)\n\n"
+            "Threat examples:\n- SQL injection (Application Software Security)\n- Exposed admin interfaces (Account Management)\n\n"
+            "CIS notes:\n- Improve input validation (CIS Control 16.4)\n- Harden account provisioning (CIS Control 5)\n+"            
+        )
+
+    # If the model_path looks like an Ollama identifier (eg. 'gemma3:270M' or an Ollama blob),
+    # try the Ollama CLI first.
+    try:
+        import subprocess
+        import json
+
+        if (
+            ".ollama" in model_path.lower()
+            or "registry.ollama.ai" in model_path.lower()
+            or model_path.lower().startswith("sha256-")
+            or model_path.lower().startswith("gemma3")
+            or ":" in model_path
+        ):
+            try:
+                cmd = ["ollama", "run", model_path, prompt, "--format", "json"]
+                proc = subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=120,
+                )
+                if proc.returncode == 0 and proc.stdout:
+                    try:
+                        j = json.loads(proc.stdout)
+                        if isinstance(j, dict) and "response" in j:
+                            return j["response"].strip()
+                        if isinstance(j, dict) and "output" in j:
+                            return j["output"].strip()
+                        if isinstance(j, dict) and "choices" in j:
+                            text = "\n".join([c.get("content", "") for c in j["choices"]])
+                            return text.strip()
+                    except Exception:
+                        return proc.stdout.strip()
+                else:
+                    print(f"WARNING: ollama run failed: {proc.stderr.strip()}")
+            except FileNotFoundError:
+                # Ollama not installed; fall back to other backends
+                pass
+            except Exception as exc:
+                print(f"WARNING: ollama invocation failed: {exc}")
+    except Exception:
+        pass
+
+    # Prefer the transformers backend for Gemma-family models (e.g., gemma3-270m)
+    try:
+        if "gemma" in model_path.lower():
+            from transformers import pipeline
+            import torch
+
+            device = 0 if torch.cuda.is_available() else "cpu"
+            generator = pipeline(
+                "text-generation",
+                model=model_path,
+                device=device,
+                torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
+            )
+            output = generator(prompt, max_new_tokens=max_tokens, do_sample=False)[0]["generated_text"]
+            return output[len(prompt) :] if output.startswith(prompt) else output
+    except Exception as exc:
+        print(f"WARNING: transformers (preferred for Gemma) failed: {exc}")
+
     try:
         from llama_cpp import Llama
 
@@ -195,40 +332,93 @@ def local_llm_query(prompt: str, model_path: str, max_tokens: int = 1024) -> str
         raise RuntimeError(f"Local model generation failed: {exc}") from exc
 
 
-def format_irius_prompt(architecture_text: str) -> str:
+def format_assessment_prompt(architecture_text: str) -> str:
+    controls = [
+        "Data Protection",
+        "Account Management",
+        "Access Control Management",
+        "Audit Log Management",
+        "Network Monitoring and Defense",
+        "Application Software Security",
+    ]
+
+    controls_list = "\n".join([f"- {c}" for c in controls])
+
     return (
         "You are a cybersecurity analyst reviewing an architecture diagram. "
-        "Provide a concise Irius Risk assessment and CIS coverage estimate for Application Software Security "
-        "and Data Protection controls.\n\n"
+        "Provide a concise threat assessment mapped to the following CIS Critical Security Controls and their relevant safeguards:\n"
+        f"{controls_list}\n\n"
         "Architecture description:\n"
         f"{architecture_text}\n\n"
-        "Respond with exact lines for counts and percentages:\n"
+        "Respond with exact lines for counts and percentages, and when applicable include CIS Control and Safeguard numbers in parentheses.\n"
         "Critical: <number>\n"
         "High: <number>\n"
         "Medium: <number>\n"
-        "Low: <number>\n"
-        "Application Software Security coverage: <percentage>%\n"
-        "Data Protection coverage: <percentage>%\n"
-        "Threat examples:\n"
-        "- ...\n"
-        "CIS notes:\n"
+        "Low: <number>\n\n"
+        "For each control above, provide a coverage percentage line like:\n"
+        "<Control Name> coverage: <percentage>% (CIS Control <x>, Safeguard <y>)\n\n"
+        "Threat examples (prefix each with '- '):\n"
+        "- ...\n\n"
+        "CIS notes and recommended safeguards (include control/safeguard numbers when relevant):\n"
         "- ...\n"
     )
 
 
 def parse_counts_and_percentages(text: str) -> Dict[str, Any]:
     counts = {"Critical": 0, "High": 0, "Medium": 0, "Low": 0}
-    coverage = {
-        "Application Software Security": 0,
-        "Data Protection": 0,
-    }
+    controls = [
+        "Data Protection",
+        "Account Management",
+        "Access Control Management",
+        "Audit Log Management",
+        "Network Monitoring and Defense",
+        "Application Software Security",
+    ]
+    coverage: Dict[str, int] = {c: 0 for c in controls}
+    safeguards: Dict[str, List[str]] = {c: [] for c in controls}
     threats: List[str] = []
     notes: List[str] = []
+
+    # If the model returned a JSON blob with counts/coverage, accept that too
+    stripped = text.strip()
+    if stripped.startswith("{") or stripped.startswith("["):
+        try:
+            obj = json.loads(stripped)
+            if isinstance(obj, dict):
+                # counts may be top-level
+                for sev in ["Critical", "High", "Medium", "Low"]:
+                    if sev in obj:
+                        counts[sev] = int(obj.get(sev) or 0)
+
+                # coverage may be nested or top-level
+                for c in coverage.keys():
+                    if c in obj:
+                        try:
+                            coverage[c] = int(obj.get(c) or 0)
+                        except Exception:
+                            pass
+
+                # threats list
+                if "threats" in obj and isinstance(obj["threats"], list):
+                    threats.extend([str(t) for t in obj["threats"]])
+
+                # notes/raw
+                notes.append(str(obj))
+                return {
+                    "counts": counts,
+                    "coverage": coverage,
+                    "safeguards": safeguards,
+                    "threat_examples": threats,
+                    "notes": notes,
+                }
+        except Exception:
+            pass
 
     for line in text.splitlines():
         line = line.strip()
         if not line:
             continue
+
         count_match = re.match(r"^(Critical|High|Medium|Low)\s*[:=-]\s*(\d+)", line, re.I)
         if count_match:
             severity = count_match.group(1).capitalize()
@@ -236,14 +426,36 @@ def parse_counts_and_percentages(text: str) -> Dict[str, Any]:
             continue
 
         percent_match = re.match(
-            r"^(Application Software Security|Data Protection) coverage\s*[:=-]\s*(\d+)%?",
+            r"^(Data Protection|Account Management|Access Control Management|Audit Log Management|Network Monitoring and Defense|Application Software Security)\s*coverage\s*[:=-]\s*(\d+)%?",
             line,
             re.I,
         )
         if percent_match:
             name = percent_match.group(1)
             coverage[name] = int(percent_match.group(2))
+            # also look for CIS control/safeguard numbers in the same line
+            cis_nums = re.findall(r"CIS(?: Control)?\s*(\d+(?:\.\d+)?)|Safeguard\s*(\d+(?:\.\d+)?)", line, re.I)
+            if cis_nums:
+                for g1, g2 in cis_nums:
+                    num = g1 or g2
+                    if num:
+                        safeguards[name].append(num)
             continue
+
+        # capture CIS control/safeguard mentions standalone
+        cis_inline = re.findall(r"CIS(?: Control)?\s*(\d+(?:\.\d+)?)|Safeguard\s*(\d+(?:\.\d+)?)", line, re.I)
+        if cis_inline:
+            # associate to any control mentioned in the line, otherwise put into notes
+            matched = False
+            for c in controls:
+                if c.lower() in line.lower():
+                    for g1, g2 in cis_inline:
+                        num = g1 or g2
+                        if num:
+                            safeguards[c].append(num)
+                    matched = True
+            if matched:
+                continue
 
         if line.startswith("-"):
             if "Threat examples" in text or "Threats" in text:
@@ -254,105 +466,148 @@ def parse_counts_and_percentages(text: str) -> Dict[str, Any]:
     return {
         "counts": counts,
         "coverage": coverage,
+        "safeguards": safeguards,
         "threat_examples": threats,
         "notes": notes,
     }
 
 
-def query_irius_risk(
-    architecture_text: str,
-    api_url: Optional[str],
-    api_key: Optional[str],
-) -> Optional[Dict[str, Any]]:
-    if not api_url or not api_key:
-        return None
+def run_pytm_model(source_path: Path) -> List[str]:
+    """Attempt to run OWASP pytm threat analysis on the Draw.io structure.
 
-    import requests
+    Returns a list of human-readable threat strings. If `pytm` is not
+    available or integration fails, returns an empty list.
+    """
+    try:
+        import pytm
+    except Exception:
+        return []
 
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-    }
-    payload = {"architecture_description": architecture_text}
-    endpoints = [api_url]
+    try:
+        struct = parse_drawio_struct(source_path)
+        nodes = struct.get('nodes', [])
+        edges = struct.get('edges', [])
 
-    if api_url.endswith("/"):
-        endpoints.append(api_url + "api/1/threats")
-        endpoints.append(api_url + "v1/threats")
-    else:
-        endpoints.append(api_url + "/api/1/threats")
-        endpoints.append(api_url + "/v1/threats")
+        # Find classes in pytm module
+        TM = getattr(pytm, 'TM', None)
+        Server = getattr(pytm, 'Server', None)
+        ProcessCls = getattr(pytm, 'Process', None)
+        External = getattr(pytm, 'ExternalEntity', None) or getattr(pytm, 'Actor', None)
+        DataCls = getattr(pytm, 'Data', None)
+        DataflowCls = getattr(pytm, 'Dataflow', None) or getattr(pytm, 'DataFlow', None)
 
-    for endpoint in endpoints:
-        try:
-            response = requests.post(endpoint, headers=headers, json=payload, timeout=20)
-            if response.status_code != 200:
+        if TM is None:
+            return []
+
+        tm = TM(source_path.name)
+
+        created: Dict[str, Any] = {}
+        # Heuristic mapping of node labels to pytm classes
+        for n in nodes:
+            label = n.get('label', '')
+            key = n.get('id') or label
+            obj = None
+            lname = label.lower()
+            try:
+                if Server and any(x in lname for x in ('web', 'app', 'server', 'api')):
+                    obj = Server(label)
+                elif External and any(x in lname for x in ('user', 'actor', 'client')):
+                    obj = External(label)
+                elif DataCls and any(x in lname for x in ('db', 'data', 'store', 'database')):
+                    obj = DataCls(label)
+                elif ProcessCls:
+                    obj = ProcessCls(label)
+            except Exception:
+                # best-effort: skip creation if constructor signatures differ
+                obj = None
+
+            if obj is not None:
+                created[key] = obj
+                # attempt to attach to tm in common collections
+                try:
+                    if hasattr(tm, 'servers'):
+                        tm.servers.append(obj)
+                    elif hasattr(tm, 'processes'):
+                        tm.processes.append(obj)
+                except Exception:
+                    pass
+
+        # Create dataflows
+        for e in edges:
+            src = created.get(e.get('source'))
+            tgt = created.get(e.get('target'))
+            if not src or not tgt:
                 continue
-            data = response.json()
-            return parse_irius_response(data)
+            try:
+                if DataflowCls:
+                    # try different constructor signatures
+                    try:
+                        df = DataflowCls(src, tgt, e.get('label') or '')
+                        if hasattr(tm, 'dataFlows'):
+                            tm.dataFlows.append(df)
+                        elif hasattr(tm, 'dataFlows'):
+                            tm.dataFlows.append(df)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+        # Try to run the analysis; API varies by pytm versions
+        threats: List[str] = []
+        try:
+            if hasattr(tm, 'process'):
+                tm.process()
+            elif hasattr(tm, 'run'):
+                tm.run()
+            elif hasattr(tm, 'analyze'):
+                tm.analyze()
+
+            # collect generated findings if available
+            if hasattr(tm, 'threats') and isinstance(tm.threats, list):
+                for t in tm.threats:
+                    threats.append(str(t))
+            elif hasattr(tm, 'results'):
+                for r in getattr(tm, 'results') or []:
+                    threats.append(str(r))
         except Exception:
-            continue
+            # best-effort: if processing failed, return empty
+            return []
 
-    return None
+        return threats
+    except Exception:
+        return []
 
 
-def parse_irius_response(payload: Dict[str, Any]) -> Dict[str, Any]:
-    counts = {"Critical": 0, "High": 0, "Medium": 0, "Low": 0}
-    threat_items: List[Dict[str, Any]] = []
-
-    for item in payload.get("threats", []) or []:
-        severity = (item.get("severity") or item.get("risk") or item.get("priority") or "").capitalize()
-        if severity in counts:
-            counts[severity] += 1
-        else:
-            if severity:
-                counts[severity] = counts.get(severity, 0) + 1
-        threat_items.append(item)
-
-    return {
-        "counts": counts,
-        "threats": threat_items,
-        "raw": payload,
-    }
+# External API integration removed. All assessment is performed locally
+# using the LLM output mapped to CIS controls listed in `format_assessment_prompt`.
 
 
 def build_report_markdown(
     source_path: Path,
     architecture_text: str,
     llm_output: str,
-    iriussummary: Optional[Dict[str, Any]],
     parsed_data: Dict[str, Any],
 ) -> str:
     counts = parsed_data["counts"]
     coverage = parsed_data["coverage"]
+    safeguards = parsed_data.get("safeguards", {})
     threats = parsed_data["threat_examples"]
     notes = parsed_data["notes"]
 
     markdown = [f"# Security Assessment Report", "", f"**Source file:** {source_path.name}", ""]
 
-    if iriussummary:
-        api_counts = iriussummary.get("counts", {})
-        markdown += ["## Irius Risk API summary", "", "| Severity | Count |", "|---|---|"]
-        for severity in ["Critical", "High", "Medium", "Low"]:
-            markdown.append(f"| {severity} | {api_counts.get(severity, 0)} |")
-        markdown.append("")
-        markdown.append("### Irius API raw findings")
-        markdown.append("```json")
-        markdown.append(json.dumps(iriussummary.get("raw", {}), indent=2))
-        markdown.append("```")
-        markdown.append("")
-
-    markdown += ["## Local Irius Risk estimate", "", "| Severity | Count |", "|---|---|"]
+    markdown += ["## Local assessment - severity summary", "", "| Severity | Count |", "|---|---|"]
     for severity in ["Critical", "High", "Medium", "Low"]:
         markdown.append(f"| {severity} | {counts.get(severity, 0)} |")
     markdown.append("")
 
     markdown.append("## CIS coverage estimates")
     markdown.append("")
-    markdown.append("| Control | Coverage |")
-    markdown.append("|---|---|")
-    markdown.append(f"| Application Software Security | {coverage['Application Software Security']}% |")
-    markdown.append(f"| Data Protection | {coverage['Data Protection']}% |")
+    markdown.append("| Control | Coverage | Safeguards (CIS) |")
+    markdown.append("|---|---|---|")
+    for control, pct in coverage.items():
+        sg = ", ".join(safeguards.get(control, [])) if safeguards.get(control) else "-"
+        markdown.append(f"| {control} | {pct}% | {sg} |")
     markdown.append("")
 
     if threats:
@@ -443,11 +698,11 @@ def main() -> int:
     parser.add_argument("--output", required=True, help="Output path for the report, either .md or .pdf.")
     parser.add_argument(
         "--model-path",
-        required=True,
-        help="Path to a local open-source model file (for example llama-2-7b-chat.gguf or a local transformers model path).",
+        required=False,
+        default="gemma3-270m",
+        help="Path or identifier of a local/open-source model (default: gemma3-270m).",
     )
-    parser.add_argument("--irius-api-url", help="Optional Irius Risk API hostname or endpoint.")
-    parser.add_argument("--irius-api-key", help="Optional Bearer API key for Irius Risk.")
+    # External API integration removed; assessments are local using CIS controls.
     parser.add_argument("--format", choices=["md", "pdf"], help="Explicit output format. Overrides output extension.")
     parser.add_argument("--ocr", action="store_true", help="Enable OCR when extracting PDF text from image-based diagrams.")
     args = parser.parse_args()
@@ -465,7 +720,15 @@ def main() -> int:
         print(f"ERROR: {exc}")
         return 2
 
-    prompt = format_irius_prompt(architecture_summary)
+    # Run pytm-based threat modeling (best-effort). Results will be merged
+    # into the parsed LLM output if available.
+    pytm_threats: List[str] = []
+    try:
+        pytm_threats = run_pytm_model(source_path)
+    except Exception:
+        pytm_threats = []
+
+    prompt = format_assessment_prompt(architecture_summary)
     try:
         llm_output = local_llm_query(prompt, args.model_path)
     except Exception as exc:
@@ -473,8 +736,10 @@ def main() -> int:
         return 3
 
     parsed_data = parse_counts_and_percentages(llm_output)
-    iriussummary = query_irius_risk(architecture_summary, args.irius_api_url, args.irius_api_key)
-    report_text = build_report_markdown(source_path, architecture_summary, llm_output, iriussummary, parsed_data)
+    if pytm_threats:
+        parsed_data.setdefault('threat_examples', [])
+        parsed_data['threat_examples'].extend([f"[pytm] {t}" for t in pytm_threats])
+    report_text = build_report_markdown(source_path, architecture_summary, llm_output, parsed_data)
 
     output_format = determine_output_format(output_path, args.format)
     try:
