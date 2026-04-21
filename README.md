@@ -55,6 +55,37 @@ python agent.py \
   --ocr
 ```
 
+## Discord Bot Integration
+
+The agent can also run as a Discord bot for interactive security assessments and Q&A.
+
+### Setup
+
+1. Follow the [Discord Bot Setup Instructions](DISCORD_SETUP.md)
+2. Install additional dependencies:
+   ```bash
+   pip install discord.py
+   ```
+
+### Running the Bot
+
+```bash
+python discord_bot.py
+```
+
+### Bot Features
+
+**Security Assessments:**
+- Upload Draw.io files to any channel for automated analysis
+- Receives comprehensive security reports with threat modeling
+
+**Security Q&A:**
+- Ask general security questions via mentions or DMs
+- Examples:
+  - `@Bot What WAF tools do you recommend for AWS?`
+  - `@Bot How to secure AI applications?`
+  - `@Bot Best practices for API security`
+
 ## Output
 
 The report includes:

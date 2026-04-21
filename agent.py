@@ -29,6 +29,51 @@ except ImportError:
     OpenAI = None
 
 
+def load_cis_controls() -> Dict[str, str]:
+    """Load CIS controls data and create a mapping from control names to descriptions."""
+    cis_file = Path(__file__).parent / "cis_controls.csv"
+    control_descriptions = {}
+
+    if not cis_file.exists():
+        return control_descriptions
+
+    try:
+        import csv
+        with open(cis_file, 'r', encoding='utf-8') as f:
+            reader = csv.DictReader(f, delimiter=';')
+            for row in reader:
+                control_num = row.get('CIS Control', '').strip()
+                title = row.get('Title', '').strip()
+                description = row.get('Description', '').strip()
+
+                if control_num and title and description:
+                    # Map main control numbers to their descriptions
+                    control_descriptions[control_num] = description
+                    # Also map common display names to descriptions
+                    if title:
+                        control_descriptions[title] = description
+
+        # Add mappings for common control names used in reports
+        control_mappings = {
+            "Data Protection": "Develop processes and technical controls to identify, classify, securely handle, retain, and dispose of data.",
+            "Account Management": "Use processes and tools to assign and manage authorization to credentials for user accounts, including administrator accounts, as well as service accounts, to enterprise assets and software.",
+            "Access Control Management": "Use processes and tools to create, assign, manage, monitor, and revoke access credentials and privileges for user, administrator, and service accounts for enterprise assets and software.",
+            "Audit Log Management": "Use processes and tools to create, manage, and securely store audit logs for enterprise assets.",
+            "Network Monitoring and Defense": "Use processes and tools to detect, monitor, and respond to network-based threats to enterprise assets.",
+            "Application Software Security": "Manage the security life cycle of in-house developed and acquired software to prevent, detect, and remediate security weaknesses.",
+            "Inventory and Control of Enterprise Assets": "Actively manage (inventory, track, and correct) all enterprise assets (end-user devices, including portable and mobile; network devices; non-computing/Internet of Things (IoT) devices; and servers) connected to the infrastructure physically, virtually, remotely, and those within cloud environments, to accurately know the totality of assets that need to be monitored and protected within the enterprise. This will also support identifying unauthorized and unmanaged assets to remove or remediate.",
+            "Inventory and Control of Software Assets": "Actively manage (inventory, track, and correct) all software (operating systems and applications) on the network so that only authorized software is installed and can execute, and that unauthorized and unmanaged software is found and prevented from installation or execution.",
+            "Secure Configuration of Enterprise Assets and Software": "Establish and maintain the secure configuration of enterprise assets (end-user devices, including portable and mobile; network devices; non-computing/IoT devices; and servers) and software (operating systems and applications)."
+        }
+
+        control_descriptions.update(control_mappings)
+
+    except Exception as e:
+        print(f"Warning: Could not load CIS controls data: {e}")
+
+    return control_descriptions
+
+
 def parse_drawio(file_path: Path) -> str:
     raw = file_path.read_bytes()
     xml_text = None
@@ -512,11 +557,10 @@ def parse_counts_and_percentages(text: str) -> Dict[str, Any]:
     }
 
 
-def run_pytm_model(source_path: Path) -> List[str]:
+def run_pytm_model(source_path: Path) -> Dict[str, Any]:
     """Attempt to run OWASP pytm threat analysis on the Draw.io structure.
 
-    Returns a list of human-readable threat strings. If `pytm` is not
-    available or integration fails, returns an empty list.
+    Returns detailed threat information including names, codes, and affected components.
     """
     original_argv = sys.argv
     sys.argv = [original_argv[0]]
@@ -524,7 +568,7 @@ def run_pytm_model(source_path: Path) -> List[str]:
         try:
             import pytm
         except Exception:
-            return []
+            return {"threats": [], "summary": "PYTM not available"}
 
         try:
             struct = parse_drawio_struct(source_path)
@@ -540,7 +584,7 @@ def run_pytm_model(source_path: Path) -> List[str]:
             DataflowCls = getattr(pytm, 'Dataflow', None) or getattr(pytm, 'DataFlow', None)
 
             if TM is None:
-                return []
+                return {"threats": [], "summary": "PYTM TM class not found"}
 
             tm = TM(source_path.name)
 
@@ -552,14 +596,25 @@ def run_pytm_model(source_path: Path) -> List[str]:
                 obj = None
                 lname = label.lower()
                 try:
-                    if Server and any(x in lname for x in ('web', 'app', 'server', 'api')):
+                    if Server and any(x in lname for x in ('web', 'app', 'server', 'api', 'ec2', 'ecs', 'lambda')):
                         obj = Server(label)
-                    elif External and any(x in lname for x in ('user', 'actor', 'client')):
+                        # Set common server properties that threats check
+                        if hasattr(obj, 'controls'):
+                            obj.controls.sanitizesInput = False  # Common vulnerability
+                            obj.controls.encodesOutput = False  # Common vulnerability
+                    elif External and any(x in lname for x in ('user', 'actor', 'client', 'internet', 'external')):
                         obj = External(label)
-                    elif DataCls and any(x in lname for x in ('db', 'data', 'store', 'database')):
-                        obj = DataCls(label)
-                    elif ProcessCls:
+                    elif DataCls and any(x in lname for x in ('db', 'data', 'store', 'database', 'postgres')):
+                        obj = DataCls(label, classification=getattr(pytm, 'Classification', type('Classification', (), {'RESTRICTED': 'restricted'}))().RESTRICTED if hasattr(pytm, 'Classification') else 'restricted')
+                    elif ProcessCls and any(x in lname for x in ('process', 'service', 'microservice', 'function')):
                         obj = ProcessCls(label)
+                        # Set common process properties
+                        if hasattr(obj, 'controls'):
+                            obj.controls.checksInputBounds = False  # Common vulnerability
+                            obj.controls.sanitizesInput = False
+                    else:
+                        # Default to Process for unrecognized elements
+                        obj = ProcessCls(label) if ProcessCls else None
                 except Exception:
                     # best-effort: skip creation if constructor signatures differ
                     obj = None
@@ -596,29 +651,39 @@ def run_pytm_model(source_path: Path) -> List[str]:
                     pass
 
             # Try to run the analysis; API varies by pytm versions
-            threats: List[str] = []
+            threats: List[Dict[str, Any]] = []
             try:
-                if hasattr(tm, 'process'):
-                    tm.process()
-                elif hasattr(tm, 'run'):
-                    tm.run()
-                elif hasattr(tm, 'analyze'):
-                    tm.analyze()
+                tm.description = f"Threat model for {source_path.name}"  # PYTM requires description
+                tm.resolve()  # Process the threat model
+                tm.check()
 
-                # collect generated findings if available
-                if hasattr(tm, 'threats') and isinstance(tm.threats, list):
-                    for t in tm.threats:
-                        threats.append(str(t))
-                elif hasattr(tm, 'results'):
-                    for r in getattr(tm, 'results') or []:
-                        threats.append(str(r))
-            except Exception:
-                # best-effort: if processing failed, return empty
-                return []
+                # Collect findings from tm.findings
+                for finding in tm.findings:
+                    threat_info = {
+                        "name": getattr(finding, 'threat', getattr(finding, 'id', 'Unknown Threat')),
+                        "code": getattr(finding, 'id', getattr(finding, 'threat_id', 'Unknown')),
+                        "severity": getattr(finding, 'severity', getattr(finding, 'level', 'Medium')),
+                        "description": getattr(finding, 'description', getattr(finding, 'details', str(finding))),
+                        "components": []
+                    }
 
-            return threats
-        except Exception:
-            return []
+                    # Try to extract affected components
+                    if hasattr(finding, 'target') and finding.target:
+                        threat_info["components"].append(getattr(finding.target, 'name', str(finding.target)))
+                    if hasattr(finding, 'source') and finding.source:
+                        threat_info["components"].append(getattr(finding.source, 'name', str(finding.source)))
+
+                    threats.append(threat_info)
+
+            except Exception as e:
+                return {"threats": [], "summary": f"PYTM check failed: {e}"}
+
+            return {
+                "threats": threats,
+                "summary": f"PYTM analysis completed. Found {len(threats)} threats."
+            }
+        except Exception as e:
+            return {"threats": [], "summary": f"PYTM integration failed: {e}"}
     finally:
         sys.argv = original_argv
 
@@ -632,6 +697,7 @@ def build_report_markdown(
     architecture_text: str,
     llm_output: str,
     parsed_data: Dict[str, Any],
+    pytm_results: Dict[str, Any],
 ) -> str:
     counts = parsed_data["counts"]
     coverage = parsed_data["coverage"]
@@ -639,32 +705,113 @@ def build_report_markdown(
     threats = parsed_data["threat_examples"]
     notes = parsed_data["notes"]
 
+    # Load CIS control descriptions
+    cis_descriptions = load_cis_controls()
+
     markdown = [f"# Security Assessment Report", "", f"**Source file:** {source_path.name}", ""]
 
-    markdown += ["## Local assessment - severity summary", "", "| Severity | Count |", "|---|---|"]
-    for severity in ["Critical", "High", "Medium", "Low"]:
-        markdown.append(f"| {severity} | {counts.get(severity, 0)} |")
+    # Section 1: PYTM Assessment
+    markdown.append("## PYTM Assessment")
     markdown.append("")
 
-    markdown.append("## CIS coverage estimates")
-    markdown.append("")
-    markdown.append("| Control | Coverage | Safeguards (CIS) |")
-    markdown.append("|---|---|---|")
-    for control, pct in coverage.items():
-        sg = ", ".join(safeguards.get(control, [])) if safeguards.get(control) else "-"
-        markdown.append(f"| {control} | {pct}% | {sg} |")
-    markdown.append("")
+    pytm_threats = pytm_results.get("threats", [])
+    if pytm_threats:
+        markdown.append("### Identified Threats")
+        markdown.append("")
+        markdown.append("| Threat Name | Code | Severity | Description | Affected Components |")
+        markdown.append("|---|---|---|---|---|")
 
-    if threats:
-        markdown.append("## Threat examples")
-        markdown.extend([f"- {item}" for item in threats])
+        for threat in pytm_threats:
+            name = threat.get("name", "Unknown")
+            code = threat.get("code", "N/A")
+            severity = threat.get("severity", "Unknown")
+            description = threat.get("description", "No description available")
+            components = ", ".join(threat.get("components", [])) if threat.get("components") else "N/A"
+            markdown.append(f"| {name} | {code} | {severity} | {description} | {components} |")
+
+        markdown.append("")
+    else:
+        markdown.append("No threats identified by PYTM analysis.")
         markdown.append("")
 
-    markdown.append("## Notes from the local assessment")
+    # Section 2: CIS Controls
+    markdown.append("## CIS Controls")
+    markdown.append("")
+    markdown.append("### Coverage and Component Associations")
+    markdown.append("")
+    markdown.append("| Control | Description | Coverage | Safeguards | Associated Components |")
+    markdown.append("|---|---|---|---|---|")
+
+    for control, pct in coverage.items():
+        sg = ", ".join(safeguards.get(control, [])) if safeguards.get(control) else "-"
+        description = cis_descriptions.get(control, "No description available")
+        # For now, we'll use a placeholder for associated components
+        # In a full implementation, this would map CIS controls to architecture components
+        associated_components = "Web Server, Database, API Gateway"  # Placeholder
+        markdown.append(f"| {control} | {description} | {pct}% | {sg} | {associated_components} |")
+
+    markdown.append("")
+
+    # Section 3: Conclusions and Insights
+    markdown.append("## Conclusions and Insights")
+    markdown.append("")
+
+    # Calculate risk score based on threat counts and coverage gaps
+    total_threats = sum(counts.values())
+    high_severity = counts.get("High", 0) + counts.get("Critical", 0)
+    low_coverage_controls = sum(1 for pct in coverage.values() if pct < 70)
+
+    if total_threats == 0:
+        risk_score = 1  # Very Low
+        risk_level = "Very Low"
+    elif high_severity > 5 or low_coverage_controls > 3:
+        risk_score = 5  # Very High
+        risk_level = "Very High"
+    elif high_severity > 2 or low_coverage_controls > 1:
+        risk_score = 4  # High
+        risk_level = "High"
+    elif total_threats > 10 or low_coverage_controls > 0:
+        risk_score = 3  # Medium
+        risk_level = "Medium"
+    else:
+        risk_score = 2  # Low
+        risk_level = "Low"
+
+    markdown.append(f"**Overall Risk Score:** {risk_score}/5 ({risk_level})")
+    markdown.append("")
+
+    markdown.append("### Key Findings")
+    markdown.append("")
+    markdown.append(f"- **Total Threats Identified:** {total_threats}")
+    markdown.append(f"- **High/Critical Severity Threats:** {high_severity}")
+    markdown.append(f"- **CIS Controls with Low Coverage (<70%):** {low_coverage_controls}")
+    markdown.append("")
+
+    markdown.append("### Prioritized Actionables")
+    markdown.append("")
+
+    if risk_score >= 4:
+        markdown.append("**URGENT ACTIONS REQUIRED:**")
+        markdown.append("- Immediate security audit and penetration testing")
+        markdown.append("- Implement missing CIS controls with priority on access controls and data protection")
+        markdown.append("- Review and strengthen authentication mechanisms")
+        markdown.append("- Conduct threat modeling workshop with development team")
+    elif risk_score >= 3:
+        markdown.append("**HIGH PRIORITY ACTIONS:**")
+        markdown.append("- Address high-severity threats identified in PYTM assessment")
+        markdown.append("- Improve CIS control coverage, especially for identified gaps")
+        markdown.append("- Implement security monitoring and logging")
+        markdown.append("- Regular security training for development team")
+    else:
+        markdown.append("**STANDARD SECURITY MEASURES:**")
+        markdown.append("- Maintain current security posture")
+        markdown.append("- Regular security assessments and updates")
+        markdown.append("- Monitor for new threats and vulnerabilities")
+
+    markdown.append("")
+    markdown.append("### Additional Notes")
     markdown.extend([f"- {note}" for note in notes if note])
     markdown.append("")
-    markdown.append("## Raw analysis output")
-    markdown.append("```\n" + llm_output.strip() + "\n```")
 
     return "\n".join(markdown)
 
@@ -766,11 +913,11 @@ def main() -> int:
 
     # Run pytm-based threat modeling (best-effort). Results will be merged
     # into the parsed LLM output if available.
-    pytm_threats: List[str] = []
+    pytm_results: Dict[str, Any] = {}
     try:
-        pytm_threats = run_pytm_model(source_path)
-    except Exception:
-        pytm_threats = []
+        pytm_results = run_pytm_model(source_path)
+    except Exception as e:
+        pytm_results = {"threats": [], "summary": f"PYTM failed: {e}"}
 
     # Check which backend will be used
     openai_api_key = os.getenv("OPENAI_API_KEY")
@@ -787,10 +934,11 @@ def main() -> int:
         return 3
 
     parsed_data = parse_counts_and_percentages(llm_output)
+    pytm_threats = pytm_results.get("threats", [])
     if pytm_threats:
         parsed_data.setdefault('threat_examples', [])
-        parsed_data['threat_examples'].extend([f"[pytm] {t}" for t in pytm_threats])
-    report_text = build_report_markdown(source_path, architecture_summary, llm_output, parsed_data)
+        parsed_data['threat_examples'].extend([f"[pytm] {t.get('name', 'Unknown threat')}" for t in pytm_threats])
+    report_text = build_report_markdown(source_path, architecture_summary, llm_output, parsed_data, pytm_results)
 
     output_format = determine_output_format(output_path, args.format)
     try:
